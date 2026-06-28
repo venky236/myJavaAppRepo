@@ -13,6 +13,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Plan
+        run: |
+          echo "Running Terraform Plan..."
+          echo "Plan completed successfully."
+
       - name: Print input
         run: |
           echo "Apply = ${{ inputs.apply }}"
@@ -20,7 +28,7 @@ jobs:
       - name: Apply step
         if: ${{ inputs.apply }}
         run: |
-          echo "Running Apply..."
+          echo "Running Terraform Apply..."
 
       - name: Skip step
         if: ${{ !inputs.apply }}
