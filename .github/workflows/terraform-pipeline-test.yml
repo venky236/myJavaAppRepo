@@ -1,20 +1,4 @@
-name: "Terraform Pipeline"
-
-# Flow:
-#   1. PR opened/updated  -> "plan" job runs terraform plan, comments on PR.
-#   2. PR merged (push)   -> "plan-on-merge" re-runs terraform plan, posts
-#                            the output to the job summary, uploads the
-#                            plan as an artifact. Nothing is applied yet.
-#   3. Manual apply        -> a human reviews the job summary from step 2,
-#                            copies that run's ID, then goes to
-#                            Actions -> Run workflow, and runs this same
-#                            workflow with the run ID + stack/env/acct.
-#                            The "apply" job downloads the exact plan
-#                            artifact from that run and applies it.
-#
-# The approval gate is the workflow_dispatch step itself: only someone who
-# deliberately finds the reviewed run's ID and dispatches this workflow can
-# trigger an apply.
+name: "Terraform Pipeline for pwc-aup-infra"
 
 on:
   pull_request:
@@ -22,12 +6,25 @@ on:
     paths:
       - "base/environments/*.tfvars"
       - "clay/environments/*.tfvars"
+      - "kiln-trace/environments/*.tfvars"
+      - "integration-user/environments/*.tfvars"
+      # Exclude prod until prod secrets are configured
+      - "!base/environments/prod.tfvars"
+      - "!clay/environments/prod.tfvars"
+      - "!kiln-trace/environments/prod.tfvars"
+      - "!integration-user/environments/prod.tfvars"
 
   push:
     branches: [main]
     paths:
       - "base/environments/*.tfvars"
       - "clay/environments/*.tfvars"
+      - "kiln-trace/environments/*.tfvars"
+      - "integration-user/environments/*.tfvars"
+      - "!base/environments/prod.tfvars"
+      - "!clay/environments/prod.tfvars"
+      - "!kiln-trace/environments/prod.tfvars"
+      - "!integration-user/environments/prod.tfvars"
 
   workflow_dispatch:
     inputs:
@@ -38,6 +35,8 @@ on:
         options:
           - base
           - clay
+          - kiln-trace
+          - integration-user
 
       env:
         description: "Environment"
@@ -55,6 +54,10 @@ on:
           - nonprod
           - prod
 
+env:
+  TF_VERSION: "1.12.x"
+  AWS_REGION: "us-east-1"
+
 concurrency:
   group: terraform-pipeline-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -65,6 +68,7 @@ permissions:
   actions: read
 
 jobs:
+  # ── Detect which stack/env pairs changed (PR and push only) ──────────────
   detect-changes:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     name: "Detect changed stacks"
@@ -86,12 +90,15 @@ jobs:
             BASE="${{ github.event.before }}"
           fi
 
+          # Guard against zero SHA (first push to a new branch)
           if [[ "$BASE" == "0000000000000000000000000000000000000000" || -z "$BASE" ]]; then
             BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
           fi
 
+          # Only look at changed tfvars files. The env and stack are derived
+          # directly from the file path: <stack>/environments/<env>.tfvars
           MATRIX=$(git diff --name-only "$BASE" HEAD \
-            | grep -E '^(base|clay)/environments/[^/]+\.tfvars$' \
+            | grep -E '^(base|clay|kiln-trace|integration-user)/environments/[^/]+\.tfvars$' \
             | awk -F'/' '{
                 stack = $1
                 env   = $3
@@ -110,6 +117,7 @@ jobs:
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # ── PR opened/updated: plan + comment ─────────────────────────────────────
   plan:
     name: "Plan (PR) – ${{ matrix.stack }} / ${{ matrix.env }}"
     needs: detect-changes
@@ -123,16 +131,68 @@ jobs:
       - name: Checkout
         uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@d0834ad3a60a024346910e522a81b0002bd37fea # v4.3.0
+        with:
+          # TODO: when prod is enabled, select creds based on matrix.acct
+          aws-access-key-id: ${{ secrets.NONPROD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.NONPROD_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@f4c6bf6752984b3a29fcc135a5e70eb792c40c6b # v1.8.0
+        with:
+          app-id: ${{ secrets.AMPLIWORK_PKG_READER_APP_ID }}
+          private-key: ${{ secrets.AMPLIWORK_PKG_READER_PRIVATE_KEY }}
+          repositories: aw-terraform-aws-modules
+
+      - name: Configure git for private modules
+        run: git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # ── Quality gates ────────────────────────────────────────────────────
+      - name: Terraform fmt
+        id: fmt
+        working-directory: ${{ matrix.stack }}
+        run: terraform fmt -check -recursive -diff
+        continue-on-error: true
+
+      - name: Terraform init
+        id: init
+        working-directory: ${{ matrix.stack }}
+        run: terraform init -reconfigure -backend-config="config/${{ matrix.env }}.hcl"
+
+      - name: Terraform validate
+        id: validate
+        working-directory: ${{ matrix.stack }}
+        run: terraform validate -no-color
+
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@b466648d6e39e7c75324f25d83891162a721f2d6 # v1.0.3
+        with:
+          working_directory: ${{ matrix.stack }}
+          soft_fail: true
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@ffbf56d2e40f8e09a94a2b0d95477fabff82c6dc # v12.1671.0
+        with:
+          directory: ${{ matrix.stack }}
+          config_file: .checkov.yml
+          soft_fail: true
+
+      # ── Plan ─────────────────────────────────────────────────────────────
       - name: Terraform plan
         id: plan
+        working-directory: ${{ matrix.stack }}
         run: |
-          mkdir -p ${{ matrix.stack }}
-          {
-            echo "Plan: 1 to add, 0 to change, 0 to destroy."
-            echo "  + null_resource.example_${{ matrix.env }}"
-            echo "Generated at $(date -u)"
-          } | tee ${{ matrix.stack }}/plan-output.txt
-          echo "plan output for ${{ matrix.stack }}/${{ matrix.env }}" > ${{ matrix.stack }}/tfplan
+          set -o pipefail
+          terraform plan -no-color -input=false -out=tfplan \
+            -var-file="environments/${{ matrix.env }}.tfvars" 2>&1 | tee plan-output.txt
 
       - name: Post plan to job summary
         if: always()
@@ -140,9 +200,19 @@ jobs:
           {
             echo "### Terraform Plan – \`${{ matrix.stack }}\` / \`${{ matrix.env }}\`"
             echo ""
+            echo "| Step     | Status |"
+            echo "|----------|--------|"
+            echo "| fmt      | \`${{ steps.fmt.outcome }}\` |"
+            echo "| init     | \`${{ steps.init.outcome }}\` |"
+            echo "| validate | \`${{ steps.validate.outcome }}\` |"
+            echo "| plan     | \`${{ steps.plan.outcome }}\` |"
+            echo ""
+            echo "<details><summary>Show Plan</summary>"
+            echo ""
+            echo '```terraform'
+            cat "${{ matrix.stack }}/plan-output.txt" 2>/dev/null || echo "No plan output captured."
             echo '```'
-            cat "${{ matrix.stack }}/plan-output.txt"
-            echo '```'
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post plan to PR
@@ -152,8 +222,33 @@ jobs:
           github-token: ${{ github.token }}
           script: |
             const fs = require('fs');
-            const plan = fs.readFileSync('${{ matrix.stack }}/plan-output.txt', 'utf8');
-            const output = `### Terraform Plan – \`${{ matrix.stack }}\` / \`${{ matrix.env }}\`\n\n\`\`\`\n${plan}\n\`\`\``;
+            let plan = '';
+            try {
+              plan = fs.readFileSync('${{ matrix.stack }}/plan-output.txt', 'utf8');
+            } catch (e) {
+              plan = 'Plan output unavailable.';
+            }
+            if (plan.length > 60000) {
+              plan = plan.slice(0, 60000) + '\n... (truncated, see job summary for full output)';
+            }
+
+            const output = `### Terraform Plan – \`${{ matrix.stack }}\` / \`${{ matrix.env }}\`
+
+            | Step     | Status |
+            |----------|--------|
+            | fmt      | \`${{ steps.fmt.outcome }}\` |
+            | init     | \`${{ steps.init.outcome }}\` |
+            | validate | \`${{ steps.validate.outcome }}\` |
+            | plan     | \`${{ steps.plan.outcome }}\` |
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+
+            </details>`;
+
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -161,6 +256,7 @@ jobs:
               body: output
             });
 
+  # ── PR merged (push to main): re-plan, show output, wait for manual apply ─
   plan-on-merge:
     name: "Plan (post-merge) – ${{ matrix.stack }} / ${{ matrix.env }}"
     needs: detect-changes
@@ -174,16 +270,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@d0834ad3a60a024346910e522a81b0002bd37fea # v4.3.0
+        with:
+          # TODO: when prod is enabled, select creds based on matrix.acct
+          aws-access-key-id: ${{ secrets.NONPROD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.NONPROD_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@f4c6bf6752984b3a29fcc135a5e70eb792c40c6b # v1.8.0
+        with:
+          app-id: ${{ secrets.AMPLIWORK_PKG_READER_APP_ID }}
+          private-key: ${{ secrets.AMPLIWORK_PKG_READER_PRIVATE_KEY }}
+          repositories: aw-terraform-aws-modules
+
+      - name: Configure git for private modules
+        run: git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: ${{ matrix.stack }}
+        run: terraform init -reconfigure -backend-config="config/${{ matrix.env }}.hcl"
+
       - name: Terraform plan
         id: plan
+        working-directory: ${{ matrix.stack }}
         run: |
-          mkdir -p ${{ matrix.stack }}
-          {
-            echo "Plan: 1 to add, 0 to change, 0 to destroy."
-            echo "  + null_resource.example_${{ matrix.env }}"
-            echo "Generated at $(date -u) from run ${{ github.run_id }}"
-          } | tee ${{ matrix.stack }}/plan-output.txt
-          echo "plan output for ${{ matrix.stack }}/${{ matrix.env }} run ${{ github.run_id }}" > ${{ matrix.stack }}/tfplan
+          set -o pipefail
+          terraform plan -no-color -input=false -out=tfplan \
+            -var-file="environments/${{ matrix.env }}.tfvars" 2>&1 | tee plan-output.txt
 
       - name: Post plan to job summary
         if: always()
@@ -193,9 +315,16 @@ jobs:
             echo ""
             echo "**To apply:** Actions -> Run workflow -> stack=\`${{ matrix.stack }}\`, env=\`${{ matrix.env }}\`, acct=\`${{ matrix.acct }}\` (applies the latest plan on main automatically)"
             echo ""
+            echo "| Step | Status |"
+            echo "|------|--------|"
+            echo "| plan | \`${{ steps.plan.outcome }}\` |"
+            echo ""
+            echo "<details><summary>Show Plan</summary>"
+            echo ""
+            echo '```terraform'
+            cat "${{ matrix.stack }}/plan-output.txt" 2>/dev/null || echo "No plan output captured."
             echo '```'
-            cat "${{ matrix.stack }}/plan-output.txt"
-            echo '```'
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload plan artifact
@@ -205,11 +334,48 @@ jobs:
           path: ${{ matrix.stack }}/tfplan
           retention-days: 7
 
+  # ── Manual apply: the approval gate ───────────────────────────────────────
+  # Triggered only by workflow_dispatch. Finds the latest successful
+  # post-merge plan for the chosen stack/env and applies that exact plan
+  # artifact (never a freshly-generated one), so what's applied is exactly
+  # what was reviewed in the job summary.
   apply:
     name: "Apply (approved via workflow_dispatch) – ${{ inputs.stack }} / ${{ inputs.env }}"
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@d0834ad3a60a024346910e522a81b0002bd37fea # v4.3.0
+        with:
+          # TODO: when prod is enabled, select creds based on inputs.acct
+          aws-access-key-id: ${{ secrets.NONPROD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.NONPROD_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@f4c6bf6752984b3a29fcc135a5e70eb792c40c6b # v1.8.0
+        with:
+          app-id: ${{ secrets.AMPLIWORK_PKG_READER_APP_ID }}
+          private-key: ${{ secrets.AMPLIWORK_PKG_READER_PRIVATE_KEY }}
+          repositories: aw-terraform-aws-modules
+
+      - name: Configure git for private modules
+        run: git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: ${{ inputs.stack }}
+        run: terraform init -reconfigure -backend-config="config/${{ inputs.env }}.hcl"
+
       - name: Find latest post-merge plan run
         id: find-run
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
@@ -226,7 +392,7 @@ jobs:
             });
 
             if (data.workflow_runs.length === 0) {
-              core.setFailed('No successful post-merge runs found on main. Merge a change first.');
+              core.setFailed('No successful post-merge plan runs found on main. Merge a change first.');
               return;
             }
 
@@ -243,11 +409,15 @@ jobs:
           run-id: ${{ steps.find-run.outputs.run_id }}
           github-token: ${{ github.token }}
 
-      - name: Terraform apply
+      - name: Record approval
         run: |
-          echo "### Apply approved and triggered manually" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Approved/triggered by: \`${{ github.actor }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Stack/env: \`${{ inputs.stack }}\` / \`${{ inputs.env }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Plan applied from run: ${{ steps.find-run.outputs.run_url }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Applying plan:"
-          cat ${{ inputs.stack }}/tfplan
+          {
+            echo "### Apply approved and triggered manually"
+            echo "- Approved/triggered by: \`${{ github.actor }}\`"
+            echo "- Stack/env: \`${{ inputs.stack }}\` / \`${{ inputs.env }}\`"
+            echo "- Plan applied from run: ${{ steps.find-run.outputs.run_url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply
+        working-directory: ${{ inputs.stack }}
+        run: terraform apply -auto-approve -input=false tfplan
