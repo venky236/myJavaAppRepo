@@ -1,0 +1,318 @@
+name: "IssueOps Approval TEST"
+
+# What this tests:
+#   1. push to main  -> opens an approval issue (simulates plan-on-merge)
+#   2. /approve      -> prints "APPROVED - apply would run here"
+#   3. /approve DESTROY -> same but confirms destroy acknowledgement
+#   4. /reject       -> closes issue as rejected
+#   5. unauthorized  -> reply comment saying not authorized
+#
+# No AWS, no Terraform. Pure approval flow test.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "test/trigger.txt"   # only fires when this file changes
+
+  issue_comment:
+    types: [created]
+
+env:
+  # Add secret AUTHORIZED_APPROVERS in:
+  # Settings -> Secrets and variables -> Actions -> New repository secret
+  # Value: comma-separated GitHub usernames e.g. "alice,bob"
+  AUTHORIZED_APPROVERS: ${{ secrets.AUTHORIZED_APPROVERS }}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  # ── Simulates plan-on-merge: opens the approval issue ────────────────────
+  open-approval-issue:
+    name: "Open approval issue"
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulate terraform plan output
+        id: plan
+        run: |
+          echo "stack=base"        >> "$GITHUB_OUTPUT"
+          echo "env=qa"            >> "$GITHUB_OUTPUT"
+          echo "acct=nonprod"      >> "$GITHUB_OUTPUT"
+          # Change destroy_count to a number > 0 to test /approve DESTROY flow
+          echo "destroy_count=0"   >> "$GITHUB_OUTPUT"
+
+      - name: Ensure approval labels exist
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const labels = [
+              { name: 'terraform-apply-pending',  color: 'e4e669', description: 'Terraform apply awaiting approval' },
+              { name: 'terraform-apply-approved', color: '0075ca', description: 'Terraform apply approved and completed' },
+              { name: 'terraform-apply-rejected', color: 'd73a4a', description: 'Terraform apply rejected' },
+            ];
+            for (const label of labels) {
+              try {
+                await github.rest.issues.createLabel({ owner: context.repo.owner, repo: context.repo.repo, ...label });
+              } catch (e) {
+                if (e.status !== 422) throw e;
+              }
+            }
+
+      - name: Open approval issue
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const stack        = '${{ steps.plan.outputs.stack }}';
+            const env          = '${{ steps.plan.outputs.env }}';
+            const acct         = '${{ steps.plan.outputs.acct }}';
+            const sha          = '${{ github.sha }}';
+            const runId        = '${{ github.run_id }}';
+            const destroyCount = parseInt('${{ steps.plan.outputs.destroy_count }}') || 0;
+            const approvers    = process.env.AUTHORIZED_APPROVERS;
+
+            const fakePlan = [
+              '# Simulated terraform plan output',
+              '  + null_resource.example (create)',
+              destroyCount > 0 ? '  - null_resource.old (destroy)' : '',
+              '',
+              `Plan: 1 to add, 0 to change, ${destroyCount} to destroy.`,
+            ].filter(Boolean).join('\n');
+
+            const destroyWarning = destroyCount > 0
+              ? `> ⚠️ **This plan destroys ${destroyCount} resource(s).**\n>\n> - \`null_resource.old\` (delete)\n>\n> You must comment \`/approve DESTROY\` to proceed.\n\n`
+              : '';
+
+            const approveCmd = destroyCount > 0 ? '`/approve DESTROY`' : '`/approve`';
+
+            const body = [
+              `## Terraform Apply — Approval Required`,
+              ``,
+              `| | |`,
+              `|---|---|`,
+              `| **Stack** | \`${stack}\` |`,
+              `| **Env** | \`${env}\` |`,
+              `| **Account** | \`${acct}\` |`,
+              `| **Commit** | \`${sha}\` |`,
+              `| **Plan run** | [View](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}) |`,
+              ``,
+              destroyWarning,
+              `### Authorized approvers`,
+              approvers.split(',').map(u => `- @${u.trim()}`).join('\n'),
+              ``,
+              `| Action | Comment |`,
+              `|--------|---------|`,
+              `| ✅ Approve | ${approveCmd} |`,
+              `| ❌ Reject  | \`/reject\` |`,
+              ``,
+              `<details><summary>Show Plan</summary>`,
+              ``,
+              `\`\`\`terraform`,
+              fakePlan,
+              `\`\`\``,
+              ``,
+              `</details>`,
+              ``,
+              `<!-- terraform-metadata`,
+              JSON.stringify({ stack, env, acct, sha, runId, destroyCount }),
+              `-->`,
+            ].join('\n');
+
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[TEST] Terraform Apply: ${stack}/${env} @ ${sha.slice(0, 8)}`,
+              body,
+              labels: ['terraform-apply-pending'],
+            });
+
+            console.log(`Opened approval issue #${issue.data.number}: ${issue.data.html_url}`);
+
+  # ── Handles /approve, /approve DESTROY, /reject ──────────────────────────
+  process-approval:
+    name: "Process approval comment"
+    if: >
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.event.issue.state == 'open' &&
+      contains(github.event.issue.labels.*.name, 'terraform-apply-pending')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check authorization and parse command
+        id: check
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            // Ignore PR comments
+            if (context.payload.issue.pull_request) {
+              core.setOutput('action', 'ignore');
+              return;
+            }
+
+            const commenter   = context.actor;
+            const comment     = context.payload.comment.body.trim();
+            const issueBody   = context.payload.issue.body;
+            const issueNumber = context.payload.issue.number;
+            const authorized  = process.env.AUTHORIZED_APPROVERS
+              .split(',').map(u => u.trim().toLowerCase());
+
+            // Parse metadata from issue body
+            const metaMatch = issueBody.match(/<!--\s*terraform-metadata\s*([\s\S]*?)-->/);
+            if (!metaMatch) {
+              core.setFailed('Could not find terraform-metadata block in issue body.');
+              return;
+            }
+            const meta = JSON.parse(metaMatch[1].trim());
+            core.setOutput('stack',         meta.stack);
+            core.setOutput('env',           meta.env);
+            core.setOutput('acct',          meta.acct);
+            core.setOutput('destroy_count', String(meta.destroyCount));
+
+            // Authorization check
+            if (!authorized.includes(commenter.toLowerCase())) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `@${commenter} You are not authorized to approve or reject this apply.\n\nAuthorized approvers: ${process.env.AUTHORIZED_APPROVERS.split(',').map(u => `@${u.trim()}`).join(', ')}`
+              });
+              core.setOutput('action', 'unauthorized');
+              return;
+            }
+
+            // Parse command
+            if (comment === '/reject') {
+              core.setOutput('action', 'reject');
+              return;
+            }
+
+            if (comment === '/approve') {
+              if (parseInt(meta.destroyCount) > 0) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  body: `@${commenter} This plan destroys **${meta.destroyCount} resource(s)**. Review the list above carefully.\n\nIf you accept the deletions, comment \`/approve DESTROY\` to proceed.`
+                });
+                core.setOutput('action', 'blocked-destroy');
+                return;
+              }
+              core.setOutput('action', 'approve');
+              return;
+            }
+
+            if (comment === '/approve DESTROY') {
+              if (parseInt(meta.destroyCount) === 0) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  body: `@${commenter} This plan has no destructive changes — use \`/approve\` instead.`
+                });
+                core.setOutput('action', 'ignore');
+                return;
+              }
+              core.setOutput('action', 'approve');
+              return;
+            }
+
+            core.setOutput('action', 'ignore');
+
+      # ── Reject ─────────────────────────────────────────────────────────────
+      - name: Close issue as rejected
+        if: steps.check.outputs.action == 'reject'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const issueNumber = context.payload.issue.number;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `❌ Apply **rejected** by @${context.actor}. No changes have been made.`
+            });
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              name: 'terraform-apply-pending'
+            }).catch(() => {});
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['terraform-apply-rejected']
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              state: 'closed'
+            });
+
+      # ── Approve (simulated apply) ───────────────────────────────────────────
+      - name: Simulate terraform apply
+        if: steps.check.outputs.action == 'approve'
+        id: apply
+        run: |
+          echo "Applying terraform plan for ${{ steps.check.outputs.stack }}/${{ steps.check.outputs.env }}..."
+          echo "  + null_resource.example: Creating..."
+          echo "  + null_resource.example: Creation complete."
+          echo ""
+          echo "Apply complete! Resources: 1 added, 0 changed, 0 destroyed."
+
+      - name: Close issue as approved
+        if: steps.check.outputs.action == 'approve' && steps.apply.outcome == 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const issueNumber = context.payload.issue.number;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: [
+                `✅ Apply **approved and completed** by @${context.actor}.`,
+                ``,
+                `- Stack/env/acct: \`${{ steps.check.outputs.stack }}\` / \`${{ steps.check.outputs.env }}\` / \`${{ steps.check.outputs.acct }}\``,
+                `- Commit applied: \`${{ github.sha }}\``,
+              ].join('\n')
+            });
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              name: 'terraform-apply-pending'
+            }).catch(() => {});
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['terraform-apply-approved']
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              state: 'closed'
+            });
+
+      - name: Comment on apply failure
+        if: steps.check.outputs.action == 'approve' && steps.apply.outcome == 'failure'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: [
+                `❌ Apply **failed** after being approved by @${context.actor}.`,
+                ``,
+                `Check the [workflow run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) for details.`,
+                ``,
+                `This issue remains open. Fix the problem and comment \`/approve\` again.`,
+              ].join('\n')
+            });
